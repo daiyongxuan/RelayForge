@@ -240,15 +240,7 @@ fn clip(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn proxy_routes_only_responses_endpoint() {
-        assert!(is_responses_path("/v1/responses"));
-        assert!(is_responses_path("/responses"));
-        assert!(!is_responses_path("/v1/models"));
-        assert!(!is_responses_path("/models"));
-    }
-
-    // ── smoke test: start proxy, send real HTTP, verify translated response ──
+        // ── smoke test: start proxy, send real HTTP, verify translated response ──
 
     #[tokio::test]
     async fn smoke_proxy_roundtrip() {

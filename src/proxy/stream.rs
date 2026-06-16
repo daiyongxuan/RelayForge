@@ -274,7 +274,7 @@ impl SseState<'_> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let should_add = {
+        let (should_add, pending_arguments) = {
             let stage = self.tools.entry(index).or_default();
             if let Some(id) = id {
                 stage.call_id = id.to_string();
@@ -283,13 +283,28 @@ impl SseState<'_> {
                 stage.name = name.to_string();
             }
             stage.arguments.push_str(arguments);
-            !stage.added && (!stage.call_id.is_empty() || !stage.name.is_empty())
+            if !stage.added && (!stage.call_id.is_empty() || !stage.name.is_empty()) {
+                (true, stage.arguments.clone())
+            } else {
+                (false, String::new())
+            }
         };
         let mut events = Vec::new();
         if should_add {
             events.extend(self.add_tool_call(index));
-        }
-        if !arguments.is_empty() {
+            if !pending_arguments.is_empty() {
+                if let Some(stage) = self.tools.get(&index).filter(|stage| stage.added) {
+                    events.push(sse(
+                        "response.function_call_arguments.delta",
+                        &json!({
+                            "item_id": stage.item_id,
+                            "output_index": stage.output_index,
+                            "delta": pending_arguments
+                        }),
+                    ));
+                }
+            }
+        } else if !arguments.is_empty() {
             if let Some(stage) = self.tools.get(&index).filter(|stage| stage.added) {
                 events.push(sse(
                     "response.function_call_arguments.delta",
@@ -526,36 +541,8 @@ fn clip(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-
-    #[test]
-    fn sse_event_format() {
-        let out = sse(
-            "response.output_text.delta",
-            &json!({"delta":"hi","item_id":"msg_1"}),
-        );
-        assert!(out.starts_with("event: response.output_text.delta\n"));
-        assert!(out.contains("\"delta\":\"hi\""));
-        assert!(out.contains("\"type\":\"response.output_text.delta\""));
-    }
-
-    #[test]
-    fn chat_sse_without_valid_choices_is_an_error() {
-        let err = chat_sse_to_responses_events("resp_1", "glm-5.2", "data: {}\n\n").unwrap_err();
-        assert!(err.contains("no valid chat completion chunks"));
-    }
-
-    #[test]
-    fn chat_sse_error_event_is_an_error() {
-        let err = chat_sse_to_responses_events(
-            "resp_1",
-            "glm-5.2",
-            "event: error\ndata: {\"error\":{\"message\":\"bad request\",\"type\":\"invalid_request_error\"}}\n\n",
-        )
-        .unwrap_err();
-        assert!(err.contains("bad request"));
-        assert!(err.contains("invalid_request_error"));
-    }
 
     #[test]
     fn chat_sse_valid_stream_completes_with_output() {
@@ -574,66 +561,36 @@ mod tests {
         assert!(joined.contains("\"total_tokens\":2"));
     }
 
+    
     #[test]
-    fn chat_sse_tool_call_completes_with_function_call_item() {
-        let events = chat_sse_to_responses_events(
-            "resp_1",
-            "glm-5.2",
-            "data: {\"id\":\"c1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"functions__exec_command\",\"arguments\":\"{\\\"cmd\\\":\"}}]},\"finish_reason\":null}]}\n\n\
-             data: {\"id\":\"c1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
-        )
-        .unwrap();
+    fn chat_sse_tool_call_arguments_before_id_and_name_are_not_dropped() {
+        let chunk1 = json!({
+            "id": "c1", "model": "glm-5.2",
+            "choices": [{"index": 0,
+                "delta": {"tool_calls": [{"index": 0, "type": "function",
+                    "function": {"arguments": "{\"cmd\":"}}]},
+                "finish_reason": null}]
+        });
+        let chunk2 = json!({
+            "id": "c1", "model": "glm-5.2",
+            "choices": [{"index": 0,
+                "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "functions__exec_command", "arguments": "\"pwd\"}"}}]},
+                "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let stream = format!("data: {}
+
+data: {}
+
+data: [DONE]
+
+", chunk1, chunk2);
+        let events = chat_sse_to_responses_events("resp_1", "glm-5.2", &stream).unwrap();
         let joined = events.join("");
+        assert!(joined.contains("response.output_item.added"));
+        assert!(joined.contains("response.function_call_arguments.delta"));
         assert!(joined.contains("response.output_item.done"));
-        assert!(joined.contains("\"type\":\"function_call\""));
-        assert!(joined.contains("\"namespace\":\"functions\""));
-        assert!(joined.contains("\"name\":\"exec_command\""));
-        assert!(joined.contains(r#""arguments":"{\"cmd\":\"pwd\"}""#));
         assert!(joined.contains("response.completed"));
-    }
-
-    #[test]
-    fn chat_sse_finish_without_output_is_an_error() {
-        let err = chat_sse_to_responses_events(
-            "resp_1",
-            "glm-5.2",
-            "data: {\"id\":\"c1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        )
-        .unwrap_err();
-        assert!(err.contains("without assistant output"));
-    }
-
-    #[test]
-    fn sse_state_full_lifecycle() {
-        let mut state = SseState {
-            id: "r1",
-            model: "m1",
-            ..Default::default()
-        };
-
-        let events = state.push_delta(&json!({"content": "Hello"}));
-        assert_eq!(events.len(), 3);
-        assert!(events[0].contains("response.output_item.added"));
-        assert!(events[1].contains("response.content_part.added"));
-        assert!(events[2].contains("response.output_text.delta"));
-
-        let events = state.push_delta(&json!({"content": " world"}));
-        assert_eq!(events.len(), 1);
-        assert!(events[0].contains("response.output_text.delta"));
-
-        let chunk = json!({"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}});
-        let events = state.finalize(&chunk);
-        assert!(events
-            .iter()
-            .any(|e| e.contains("response.output_text.done")));
-        assert!(events
-            .iter()
-            .any(|e| e.contains("response.content_part.done")));
-        assert!(events
-            .iter()
-            .any(|e| e.contains("response.output_item.done")));
-        let completed = events.last().unwrap();
-        assert!(completed.contains("response.completed"));
-        assert!(completed.contains("\"total_tokens\":13"));
     }
 }

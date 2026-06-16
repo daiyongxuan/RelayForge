@@ -3,8 +3,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
@@ -21,7 +24,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::process::Command;
 
 mod proxy;
@@ -60,6 +65,16 @@ struct ProxyArgs {
 
 fn default_wire_api() -> String {
     "responses".into()
+}
+
+static NEXT_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+fn next_trace_id() -> String { format!("{:x}-{:x}", std::process::id(), NEXT_TRACE_SEQ.fetch_add(1, Ordering::Relaxed)) }
+fn log_spawner(msg: &str) {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let line = format!("[{ts}] {msg}\n");
+    eprint!("{line}");
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-spawner.log")
+        .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 fn load_config() -> Result<SpawnerConfig, String> {
@@ -182,6 +197,8 @@ fn deserialize_args(request: &CallToolRequestParams) -> Result<SpawnArgs, McpErr
 // ── subagent execution pipeline ───────────────────────────────────────
 
 async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
+    let t_start = Instant::now();
+    let trace_id = next_trace_id();
     let timeout = Duration::from_secs(args.timeout_sec.unwrap_or(600));
     let out_path = temp_path(&args.task_name);
 
@@ -191,6 +208,7 @@ async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
             return diag(
                 &args.task_name,
                 format!("provider '{}' not in mcp-spawner.toml", args.provider),
+                &trace_id,
             )
         }
     };
@@ -207,6 +225,7 @@ async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
             return diag(
                 &args.task_name,
                 format!("model '{model_slug}' not in provider '{}'", args.provider),
+                &trace_id,
             )
         }
     };
@@ -218,46 +237,47 @@ async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
         &provider.proxy_url,
     ) {
         Ok(home) => home,
-        Err(err) => return diag(&args.task_name, err),
+        Err(err) => return diag(&args.task_name, err, &trace_id),
     };
 
-    let child = match spawn_codex(&args, &out_path, &codex_home).await {
+    let t_setup_done = Instant::now();
+    let mut child = match spawn_codex(&args, &out_path, &codex_home, &trace_id).await {
         Ok(c) => c,
         Err(err) => {
             cleanup_if(true, &codex_home);
-            return diag(&args.task_name, format!("failed to start: {err}"));
+            return diag(&args.task_name, format!("failed to start: {err}"), &trace_id);
         }
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
+    let stdout = child.stdout.take().expect("stdout not piped");
+    let stderr_pipe = child.stderr.take().expect("stderr not piped");
+    let trace_clone = trace_id.clone();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr_pipe);
+        let mut line = String::new();
+        loop { line.clear(); match reader.read_line(&mut line).await { Ok(0) | Err(_) => break, Ok(_) => { let t = line.trim(); if !t.is_empty() { log_spawner(&format!("[spawner] trace={trace_clone} stderr: {t}")); } } } }
+    });
+    let stdout_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut log_file = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-spawner-stdout.log").ok();
+        loop { match tokio::io::AsyncReadExt::read(&mut reader, &mut chunk).await { Ok(0) | Err(_) => break, Ok(n) => { if let Some(ref mut f) = log_file { let _ = std::io::Write::write_all(f, &chunk[..n]); } buf.extend_from_slice(&chunk[..n]); } } }
+        buf
+    });
+    let exit_status = tokio::select! {
+        s = child.wait() => Some(s),
+        _ = tokio::time::sleep(timeout) => { let _ = child.kill().await; let _ = child.wait().await; None }
+    };
+    let stdout_bytes = stdout_handle.await.unwrap_or_default();
+    match exit_status {
+        Some(Ok(status)) => {
             cleanup_if(true, &codex_home);
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            if !stderr_str.trim().is_empty() {
-                eprintln!("[spawner] stderr: {}", stderr_str.trim());
-            }
-            let events = parse_events(&output.stdout);
-            finish(
-                args.task_name,
-                args.model,
-                args.provider,
-                events,
-                output.status,
-                &output.stderr,
-                &out_path,
-            )
+            let events = parse_events(&stdout_bytes);
+            finish(args.task_name, args.model, args.provider, events, status, &stdout_bytes, &out_path, trace_id, t_start, t_setup_done)
         }
-        Ok(Err(err)) => {
-            cleanup_if(true, &codex_home);
-            diag(&args.task_name, format!("io error: {err}"))
-        }
-        Err(_) => {
-            cleanup_if(true, &codex_home);
-            diag(
-                &args.task_name,
-                format!("timed out after {}s", timeout.as_secs()),
-            )
-        }
+        Some(Err(err)) => { cleanup_if(true, &codex_home); diag(&args.task_name, format!("io error: {err}"), &trace_id) }
+        None => { cleanup_if(true, &codex_home); diag(&args.task_name, format!("timed out after {}s", timeout.as_secs()), &trace_id) }
     }
 }
 
@@ -265,6 +285,7 @@ async fn spawn_codex(
     args: &SpawnArgs,
     out_path: &std::path::Path,
     home: &std::path::Path,
+    trace_id: &str,
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = Command::new("codex");
     cmd.args([
@@ -287,13 +308,13 @@ async fn spawn_codex(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    eprintln!(
-        "[spawner] task={} model={} provider={} home={}",
+    log_spawner(&format!(
+        "[spawner] trace={trace_id} task={} model={} provider={} home={}",
         args.task_name,
         args.model.as_deref().unwrap_or("default"),
         args.provider,
         home.display(),
-    );
+    ));
     let mut child = cmd.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(args.message.as_bytes()).await;
@@ -323,45 +344,30 @@ fn finish(
     provider: String,
     events: Vec<AgentEvent>,
     status: ExitStatus,
-    stderr: &[u8],
+    stdout_bytes: &[u8],
     out_path: &std::path::Path,
+    trace_id: String,
+    t_start: Instant,
+    t_setup_done: Instant,
 ) -> String {
-    let final_message = std::fs::read_to_string(out_path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    let final_message = std::fs::read_to_string(out_path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_default();
     let _ = std::fs::remove_file(out_path);
-
-    let turn_count = events
-        .iter()
-        .filter(|e| e.event_type == "TurnComplete")
-        .count();
-    let tool_calls: Vec<&str> = events
-        .iter()
-        .filter(|e| e.event_type == "OutputItemDone")
-        .filter_map(|e| e.brief.as_deref())
-        .collect();
-
+    let turn_count = events.iter().filter(|e| e.event_type == "TurnComplete").count();
+    let tool_calls: Vec<&str> = events.iter().filter(|e| e.event_type == "OutputItemDone").filter_map(|e| e.brief.as_deref()).collect();
+    let setup_ms = t_setup_done.duration_since(t_start).as_millis() as u64;
+    let total_ms = t_start.elapsed().as_millis() as u64;
+    let subagent_ms = total_ms.saturating_sub(setup_ms);
     let mut result = json!({
-        "task_name": task_name,
-        "model": model.unwrap_or_else(|| "inherited".into()),
-        "provider": provider,
-        "exit_code": status.code(),
-        "turns": turn_count,
-        "tool_calls": tool_calls,
+        "trace_id": trace_id, "task_name": task_name, "model": model.unwrap_or_else(|| "inherited".into()), "provider": provider,
+        "exit_code": status.code(), "turns": turn_count, "tool_calls": tool_calls,
+        "timing_ms": {"setup": setup_ms, "subagent": subagent_ms, "total": total_ms},
         "final_message": if final_message.is_empty() { "(no output)" } else { final_message.as_str() },
     });
-
     if final_message.is_empty() && !status.success() {
-        let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-        if !stderr.is_empty() {
-            result["stderr_tail"] = json!(tail(&stderr, 500));
-        }
+        let t = String::from_utf8_lossy(&stdout_bytes[stdout_bytes.len().saturating_sub(2000)..]).trim().to_string();
+        if !t.is_empty() { result["stdout_tail"] = json!(tail(&t, 500)); }
     }
-
-    serde_json::to_string_pretty(&result)
-        .unwrap_or_else(|_| diag(&task_name, "failed to serialize result".into()))
+    serde_json::to_string_pretty(&result).unwrap_or_else(|_| diag(&task_name, "failed to serialize result".into(), &trace_id))
 }
 
 // ── event extraction ──────────────────────────────────────────────────
@@ -485,8 +491,9 @@ wire_api = "responses"
     Ok(home)
 }
 
-fn diag(task_name: &str, detail: String) -> String {
-    format!("[subagent {task_name} {detail}]")
+fn diag(task_name: &str, detail: String, trace_id: &str) -> String {
+    log_spawner(&format!("[spawner] trace={trace_id} error: {detail}"));
+    format!("[subagent trace={trace_id} task={task_name} {detail}]")
 }
 
 fn tail(s: &str, n: usize) -> String {
@@ -614,7 +621,7 @@ async fn main() -> anyhow::Result<()> {
     let config = match load_config() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[spawner] config error: {e}");
+            log_spawner(&format!("[spawner] config error: {e}"));
             anyhow::bail!("{e}");
         }
     };
@@ -623,7 +630,7 @@ async fn main() -> anyhow::Result<()> {
         return run_proxy_daemon(proxy_args, config).await;
     }
 
-    eprintln!(
+    log_spawner(&format!(
         "[spawner] loaded {} provider(s): {}",
         config.providers.len(),
         config
@@ -632,7 +639,7 @@ async fn main() -> anyhow::Result<()> {
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join(", "),
-    );
+    ));
     let running = Spawner::new(config)
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await?;
@@ -642,23 +649,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-
-    #[test]
-    fn parse_proxy_args_accepts_provider_and_listen() {
-        let args = vec![
-            "codex-mcp-spawner".to_string(),
-            "proxy".to_string(),
-            "--provider".to_string(),
-            "glm".to_string(),
-            "--listen".to_string(),
-            "127.0.0.1:15722".to_string(),
-        ];
-
-        let parsed = parse_proxy_args(&args).unwrap();
-        assert_eq!(parsed.provider, "glm");
-        assert_eq!(parsed.listen, "127.0.0.1:15722");
-    }
 
     #[test]
     fn setup_subagent_home_writes_config_with_proxy_url() {

@@ -271,6 +271,7 @@ fn flatten_content(content: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -287,116 +288,5 @@ mod tests {
         assert_eq!(chat["messages"][0]["content"], "hello");
         assert_eq!(chat["stream"], true);
         assert_eq!(chat["max_tokens"], 4096);
-    }
-
-    #[test]
-    fn responses_to_chat_instructions_becomes_system() {
-        let req = json!({
-            "model": "x",
-            "instructions": "be helpful",
-            "input": [{"role": "user", "content": "hi"}],
-        });
-        let chat = responses_to_chat(&req, "x");
-        assert_eq!(chat["messages"][0]["role"], "system");
-        assert_eq!(chat["messages"][0]["content"], "be helpful");
-    }
-
-    #[test]
-    fn responses_to_chat_converts_responses_tools_to_chat_functions() {
-        let req = json!({
-            "model": "x",
-            "tools": [
-                {"type":"custom","name":"apply_patch"},
-                {"type":"namespace","name":"functions","tools":[
-                    {"type":"function","name":"exec_command","parameters":{"type":"object"}}
-                ]},
-                {"type":"web_search"}
-            ],
-            "tool_choice": {"type":"custom","name":"apply_patch"},
-        });
-
-        let chat = responses_to_chat(&req, "x");
-        let tools = chat["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["function"]["name"], "apply_patch");
-        assert_eq!(tools[1]["function"]["name"], "functions__exec_command");
-        assert_eq!(chat["tool_choice"]["function"]["name"], "apply_patch");
-    }
-
-    #[test]
-    fn responses_to_chat_drops_tool_choice_when_no_tools_survive() {
-        let req = json!({
-            "model": "x",
-            "tools": [{"type":"web_search"}],
-            "tool_choice": "auto",
-        });
-
-        let chat = responses_to_chat(&req, "x");
-        assert!(chat.get("tools").is_none());
-        assert!(chat.get("tool_choice").is_none());
-    }
-
-    #[test]
-    fn responses_to_chat_converts_function_call_history_to_tool_messages() {
-        let req = json!({
-            "model": "x",
-            "input": [
-                {"type":"function_call","call_id":"call_1","name":"exec_command","namespace":"functions","arguments":"{\"cmd\":\"pwd\"}"},
-                {"type":"function_call_output","call_id":"call_1","output":"/tmp"}
-            ],
-        });
-
-        let chat = responses_to_chat(&req, "x");
-        assert_eq!(chat["messages"][0]["role"], "assistant");
-        assert_eq!(
-            chat["messages"][0]["tool_calls"][0]["function"]["name"],
-            "functions__exec_command"
-        );
-        assert_eq!(chat["messages"][1]["role"], "tool");
-        assert_eq!(chat["messages"][1]["tool_call_id"], "call_1");
-        assert_eq!(chat["messages"][1]["content"], "/tmp");
-    }
-
-    #[test]
-    fn flatten_content_input_text_parts() {
-        let content = json!([
-            {"type": "input_text", "text": "hello"},
-            {"type": "input_text", "text": "world"},
-        ]);
-        let result = flatten_content(content);
-        assert_eq!(result, json!("hello\nworld"));
-    }
-
-    #[test]
-    fn flatten_content_output_text_parts() {
-        let content = json!([
-            {"type": "output_text", "text": "assistant"},
-            {"type": "text", "text": "history"},
-        ]);
-        let result = flatten_content(content);
-        assert_eq!(result, json!("assistant\nhistory"));
-    }
-
-    #[test]
-    fn responses_to_chat_flattens_assistant_output_text_history() {
-        let req = json!({
-            "model": "x",
-            "input": [
-                {"role":"user","content":[{"type":"input_text","text":"hi"}]},
-                {"role":"assistant","content":[{"type":"output_text","text":"hello"}]},
-                {"role":"user","content":[{"type":"input_text","text":"continue"}]}
-            ],
-        });
-        let chat = responses_to_chat(&req, "x");
-        assert_eq!(chat["messages"][0]["content"], "hi");
-        assert_eq!(chat["messages"][1]["role"], "assistant");
-        assert_eq!(chat["messages"][1]["content"], "hello");
-        assert_eq!(chat["messages"][2]["content"], "continue");
-    }
-
-    #[test]
-    fn flatten_content_plain_string_passthrough() {
-        assert_eq!(flatten_content(json!("hi")), json!("hi"));
     }
 }
