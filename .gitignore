@@ -1,0 +1,13 @@
+/target/
+/.codex/
+/.agents/
+
+# Local evaluation outputs
+/eval/*-run.jsonl
+/eval/*-final.txt
+
+# Local credentials and runtime config
+mcp-spawner.toml
+*.env
+*.log
+

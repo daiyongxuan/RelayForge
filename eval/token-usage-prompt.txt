@@ -1,0 +1,25 @@
+We are evaluating whether DeepSeek v4 pro as the main planner plus an optional GLM implementation subagent improves coding quality.
+
+Task: implement token usage accounting for MCP-spawned subagents in this repository.
+
+Repo: /home/arch/eval/codex-mcp-spawner
+
+Requirements:
+1. Inspect src/main.rs and the current JSONL event format emitted by `codex exec --json`.
+2. Add subagent usage accounting to the `spawn_agent` result.
+3. The result JSON returned by MCP must include a `usage` object with at least:
+   - input_tokens
+   - cached_input_tokens
+   - output_tokens
+   - reasoning_output_tokens
+   - total_tokens
+4. If multiple turns occur, sum usage across all completed turns.
+5. Preserve the existing result fields: task_name, model, provider, exit_code, turns, tool_calls, final_message.
+6. Follow the repo reliability rule: fail fast, never hide unexpected states, never silently ignore parse errors that should be actionable.
+7. Keep the design clean. Do not add patchy compatibility layers. If old event parsing is obsolete, replace it with the current format cleanly.
+8. Add focused tests for usage parsing and result serialization.
+9. Run:
+   - cargo fmt --check
+   - cargo test
+
+If the `spawn-agent` skill and `subagent-spawner` MCP tool are available, use GLM as the implementation subagent and keep the main agent responsible for planning, reviewing, and final verification. If no subagent tool is available, implement the task directly.
