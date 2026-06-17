@@ -344,6 +344,10 @@ impl SseState<'_> {
         self.finished = true;
         let mut events = Vec::new();
         let usage = chunk.get("usage");
+        let input_tokens = usage.and_then(|u| u["prompt_tokens"].as_i64()).unwrap_or(0);
+        let output_tokens = usage.and_then(|u| u["completion_tokens"].as_i64()).unwrap_or(0);
+        let total_tokens = usage.and_then(|u| u["total_tokens"].as_i64()).unwrap_or(0);
+        eprintln!("[proxy] usage input={input_tokens} output={output_tokens} total={total_tokens}");
         events.extend(self.finalize_reasoning());
         events.extend(self.finalize_text());
         events.extend(self.finalize_tools());
@@ -356,9 +360,9 @@ impl SseState<'_> {
                 "status": "completed",
                 "output": self.completed_items(),
                 "usage": {
-                    "input_tokens": usage.and_then(|u| u["prompt_tokens"].as_i64()).unwrap_or(0),
-                    "output_tokens": usage.and_then(|u| u["completion_tokens"].as_i64()).unwrap_or(0),
-                    "total_tokens": usage.and_then(|u| u["total_tokens"].as_i64()).unwrap_or(0)
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
                 }
             }}),
         ));

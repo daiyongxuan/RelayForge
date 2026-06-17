@@ -118,9 +118,16 @@ async fn serve_responses(w: &mut (impl AsyncWriteExt + Unpin), body: &[u8], cfg:
             return;
         }
     };
+    let input_count = req.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let user_msgs = req.get("input")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().filter(|i| i.get("role").and_then(|v| v.as_str()) == Some("user")).count())
+        .unwrap_or(0);
+    let is_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    eprintln!("[proxy] req input_items={input_count} user_turns={user_msgs} stream={is_stream}");
     let chat = responses_to_chat(&req, &cfg.model_slug);
 
-    if req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if is_stream {
         stream_sse(w, &chat, &cfg).await;
     } else {
         nonstream(w, &chat, &cfg).await;
