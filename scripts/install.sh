@@ -51,7 +51,7 @@ Files created:
   ~/.codex/config.toml              Codex provider + MCP config
   ~/.codex/model-catalog.json       DeepSeek 1M model metadata
   ~/.codex/mcp-spawner.toml         GLM subagent provider config
-  ~/.codex/skills/spawn-agent/      Subagent delegation skill
+  ~/.codex/skills/n/      Subagent delegation skill
   ~/.cc-switch/cc-switch.db         cc-switch provider + proxy DB
   ~/.local/bin/codex-mcp-spawner    Subagent MCP server binary
   ~/.config/systemd/user/           cc-switch + GLM proxy services
@@ -417,32 +417,57 @@ install_spawner() {
   ok "codex-mcp-spawner installed to ${SPAWNER_HOME}/"
 }
 
-# ── Step 8: Install spawn-agent skill ──────────────────────────────────
+# ── Step 8: Install n skill ──────────────────────────────────
 install_skill() {
-  local skill_dir="${CODEX_HOME}/skills/spawn-agent"
+  local skill_dir="${CODEX_HOME}/skills/n"
   mkdir -p "${skill_dir}"
   local skill_file="${skill_dir}/SKILL.md"
-  if [ -f "${SPAWNER_REPO_DIR}/skills/spawn-agent/SKILL.md" ]; then
-    cp "${SPAWNER_REPO_DIR}/skills/spawn-agent/SKILL.md" "${skill_file}"
-    ok "spawn-agent skill installed"
+  if [ -f "${SPAWNER_REPO_DIR}/skills/n/SKILL.md" ]; then
+    cp "${SPAWNER_REPO_DIR}/skills/n/SKILL.md" "${skill_file}"
+    ok "n skill installed"
   else
-    warn "spawn-agent SKILL.md not found in repo; writing inline"
+    warn "n SKILL.md not found in repo; writing inline"
     cat > "${skill_file}" << 'SKILLEOF'
 ---
-name: spawn-agent
-description: Spawn isolated Codex subagents through MCP. Use for delegation to GLM.
+name: n
+description: Delegate isolated implementation work to a GLM subagent. Use for code writing, test generation, refactoring, or batch edits that can be specified without shared conversation context.
 ---
-# GLM Subagent Workflow
 
-Use `spawn_agent` tool with `provider: "glm"` for implementation work.
+# When to Use
 
-Default division: main agent plans + reviews, GLM subagent implements.
+Use `spawn_agent` with `provider: "glm"` when the task satisfies **all three**:
 
-## Prompt Contract
-Include: absolute paths, exact files, intended behavior, verification commands, fail-loudly requirement.
+1. **Self-contained** — the prompt can describe the full job without referencing this conversation.
+2. **Code-heavy** — the work is writing/editing code, tests, configs, or docs.
+3. **Verifiable** — a clear command exists to check correctness (`cargo test`, `pytest`, `bash -n`, etc.).
 
-## Review Contract
-After subagent returns: inspect changes, remove redundant code, run final verification.
+Do **not** use for: reading or analyzing code, making decisions, tasks < 10 lines, or anything needing conversation context.
+
+# How to Call
+
+Always include these 6 sections in `message`:
+
+1. CONTEXT: repo path, why this task exists, relevant files to READ first.
+2. TASK: exactly what to implement/change. Be specific about behavior.
+3. DO NOT: explicit boundaries — files/conventions not to touch.
+4. CONSTRAINTS: lint rules, test frameworks, code style from AGENTS.md.
+5. VERIFY: exact commands to run for validation.
+6. ON FAILURE: "Report the exact error. Do not guess. Do not work around it silently."
+
+Set `cwd` to the repo root. Default `timeout_sec` is 600; set higher for builds.
+
+# After Subagent Returns
+
+1. Read `final_message` — if it reports an error, trust it. Do not re-run the same prompt.
+2. If `exit_code != 0` or `final_message` is empty: the subagent failed. Either fix it yourself or spawn a corrected prompt.
+3. If `exit_code == 0`: open the changed files and verify the diff makes sense. Remove dead code or overlap.
+4. Run the verification command yourself before reporting success to the user.
+5. Report to the user: what changed, whether tests pass, any caveats.
+
+# Retry Pattern
+
+If subagent fails, spawn again with a **corrected prompt** — add the error message, narrow the scope, or clarify instructions. Never retry the identical prompt expecting different results.
+
 SKILLEOF
   fi
 }

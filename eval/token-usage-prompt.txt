@@ -22,4 +22,4 @@ Requirements:
    - cargo fmt --check
    - cargo test
 
-If the `spawn-agent` skill and `subagent-spawner` MCP tool are available, use GLM as the implementation subagent and keep the main agent responsible for planning, reviewing, and final verification. If no subagent tool is available, implement the task directly.
+If the `n` skill and `subagent-spawner` MCP tool are available, use GLM as the implementation subagent and keep the main agent responsible for planning, reviewing, and final verification. If no subagent tool is available, implement the task directly.

@@ -14,7 +14,7 @@ The current target setup is:
 - `src/proxy.rs` runs the provider proxy daemon.
 - `src/proxy/request.rs` converts Codex Responses API requests into Chat Completions requests.
 - `src/proxy/stream.rs` converts Chat Completions SSE chunks back into Responses API events.
-- `skills/spawn-agent/SKILL.md` documents the DeepSeek planner + GLM implementation workflow.
+- `skills/n/SKILL.md` documents the DeepSeek planner + GLM implementation workflow.
 - `scripts/deploy-vm.sh` builds, deploys, and restarts the VM-side proxy.
 
 ## Build

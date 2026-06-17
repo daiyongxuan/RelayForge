@@ -10,8 +10,8 @@ remote_binary="${REMOTE_BINARY:-/home/arch/.local/bin/${binary_name}}"
 remote_staged="${REMOTE_STAGED:-/tmp/${binary_name}.new}"
 proxy_log="${PROXY_LOG:-/tmp/codex-glm-proxy.log}"
 run_smoke="${RUN_SMOKE:-0}"
-skill_source="${SKILL_SOURCE:-skills/spawn-agent/SKILL.md}"
-remote_skill_dir="${REMOTE_SKILL_DIR:-/home/arch/.codex/skills/spawn-agent}"
+skill_source="${SKILL_SOURCE:-skills/n/SKILL.md}"
+remote_skill_dir="${REMOTE_SKILL_DIR:-/home/arch/.codex/skills/n}"
 
 log() {
   printf '[deploy] %s\n' "$*"
@@ -49,7 +49,7 @@ sync_skill() {
     exit 1
   fi
 
-  log "syncing spawn-agent skill to ${vm_host}:${remote_skill_dir}/SKILL.md"
+  log "syncing n skill to ${vm_host}:${remote_skill_dir}/SKILL.md"
   ssh "${vm_host}" "set -euo pipefail; mkdir -p '${remote_skill_dir}'"
   scp "${skill_source}" "${vm_host}:${remote_skill_dir}/SKILL.md"
 }

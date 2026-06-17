@@ -11,7 +11,7 @@
 ├── src/main.rs          — MCP server + spawner + proxy daemon CLI
 ├── src/proxy.rs         — Responses↔Chat 翻译代理
 ├── Cargo.toml            — rmcp 1.7.0, reqwest, schemars, toml
-└── spawn-agent-skill.md  — 精简版 skill 文件
+└── n-skill.md  — 精简版 skill 文件
 ```
 
 ## 架构
@@ -48,7 +48,7 @@ Provider Proxy 是提前在 Codex 沙箱外启动的 daemon。它接收子 agent
 | 请求翻译 (R→C) | ✅ | `responses_to_chat()` |
 | SSE 翻译 (C→R) | ✅ | `SseState` 状态机，5 种 SSE 事件 |
 | proxy daemon | ✅ | `codex-mcp-spawner proxy --provider glm --listen 127.0.0.1:15722` |
-| skill 文件 | ✅ | `~/.codex/skills/spawn-agent/SKILL.md` |
+| skill 文件 | ✅ | `~/.codex/skills/n/SKILL.md` |
 | 单测 | ✅ | 9 个 test 全过（TCP smoke test 在 sandbox deny bind 时显式跳过） |
 | cc-switch 配置 | ✅ | DeepSeek + GLM provider 均在 DB 中 |
 | GLM API 连通 | ✅ | curl 验证 `completed` |
@@ -96,7 +96,7 @@ GLM API key: configured locally, do not commit
 ├── config.toml                    # model_provider=deepseek, mcp_servers
 ├── cc-switch-model-catalog.json   # 父 Codex/cc-switch 使用，非 subagent catalog
 ├── mcp-spawner.toml               # [providers.glm]
-└── skills/spawn-agent/SKILL.md
+└── skills/n/SKILL.md
 
 ~/.cc-switch/
 ├── cc-switch.db                   # providers: default(deepseek), glm, codex-official
