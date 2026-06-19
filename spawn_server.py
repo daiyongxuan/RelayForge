@@ -64,8 +64,7 @@ SPAWN_AGENT_TOOL = Tool(
             },
             "timeout_sec": {
                 "type": "integer",
-                "description": "Max seconds to wait. Default 600 (10 min).",
-                "default": 600,
+                "description": "Optional max seconds to wait. Omit to use the server/provider default; an explicit value overrides that default.",
             },
         },
         "required": ["task_name", "message"],
@@ -87,7 +86,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     message: str = arguments["message"]
     model: str | None = arguments.get("model")
     cwd: str | None = arguments.get("cwd") or os.getcwd()
-    timeout_sec: int = arguments.get("timeout_sec", 600)
+    timeout_sec: int = arguments.get("timeout_sec", 1800)
 
     # Build the codex exec command. --json makes output machine-readable.
     cmd: list[str] = ["codex", "exec", "--json", "--skip-git-repo-check"]

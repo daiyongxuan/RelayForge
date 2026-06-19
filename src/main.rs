@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
-use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +47,8 @@ struct ProviderConfig {
     #[serde(default = "default_wire_api")]
     wire_api: String,
     #[serde(default)]
+    default_timeout_sec: Option<u64>,
+    #[serde(default)]
     models: Vec<ModelConfig>,
 }
 
@@ -67,13 +69,31 @@ fn default_wire_api() -> String {
     "responses".into()
 }
 
+fn effective_timeout_sec(args: &SpawnArgs, provider: &ProviderConfig) -> u64 {
+    args.timeout_sec
+        .or(provider.default_timeout_sec)
+        .unwrap_or(600)
+}
+
 static NEXT_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
-fn next_trace_id() -> String { format!("{:x}-{:x}", std::process::id(), NEXT_TRACE_SEQ.fetch_add(1, Ordering::Relaxed)) }
+fn next_trace_id() -> String {
+    format!(
+        "{:x}-{:x}",
+        std::process::id(),
+        NEXT_TRACE_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 fn log_spawner(msg: &str) {
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let line = format!("[{ts}] {msg}\n");
     eprint!("{line}");
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-spawner.log")
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/codex-spawner.log")
         .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
@@ -106,7 +126,8 @@ struct SpawnArgs {
     /// Working directory for the subagent. Defaults to the parent's cwd.
     #[serde(default)]
     cwd: Option<String>,
-    /// Max seconds to wait. Default 600.
+    /// Optional max seconds to wait. Omit to use the provider's default_timeout_sec;
+    /// an explicit value overrides the provider default.
     #[serde(default)]
     timeout_sec: Option<u64>,
 }
@@ -135,7 +156,7 @@ impl Spawner {
             serde_json::from_value(schema).expect("SpawnArgs schema must be a JSON object");
         Self {
             tool: Arc::new(Tool::new(
-                Cow::Borrowed("spawn_agent"),
+                Cow::Borrowed("run"),
                 Cow::Borrowed(TOOL_DESCRIPTION),
                 Arc::new(schema),
             )),
@@ -148,7 +169,7 @@ impl ServerHandler for Spawner {
     fn get_info(&self) -> ServerInfo {
         let capabilities = ServerCapabilities::builder().enable_tools().build();
         ServerInfo::new(capabilities)
-            .with_instructions("Use spawn_agent to launch isolated Codex subagents.")
+            .with_instructions("Use run to launch isolated Codex subagents.")
     }
 
     fn list_tools(
@@ -171,7 +192,7 @@ impl ServerHandler for Spawner {
         request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if request.name.as_ref() != "spawn_agent" {
+        if request.name.as_ref() != "run" {
             return Err(unknown_tool(&request.name));
         }
         let args: SpawnArgs = deserialize_args(&request)?;
@@ -199,7 +220,6 @@ fn deserialize_args(request: &CallToolRequestParams) -> Result<SpawnArgs, McpErr
 async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
     let t_start = Instant::now();
     let trace_id = next_trace_id();
-    let timeout = Duration::from_secs(args.timeout_sec.unwrap_or(600));
     let out_path = temp_path(&args.task_name);
 
     let provider = match config.providers.get(&args.provider) {
@@ -212,6 +232,8 @@ async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
             )
         }
     };
+    let timeout_sec = effective_timeout_sec(&args, &provider);
+    let timeout = Duration::from_secs(timeout_sec);
     let model_slug = args.model.as_deref().unwrap_or_else(|| {
         provider
             .models
@@ -245,7 +267,11 @@ async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
         Ok(c) => c,
         Err(err) => {
             cleanup_if(true, &codex_home);
-            return diag(&args.task_name, format!("failed to start: {err}"), &trace_id);
+            return diag(
+                &args.task_name,
+                format!("failed to start: {err}"),
+                &trace_id,
+            );
         }
     };
 
@@ -255,14 +281,39 @@ async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr_pipe);
         let mut line = String::new();
-        loop { line.clear(); match reader.read_line(&mut line).await { Ok(0) | Err(_) => break, Ok(_) => { let t = line.trim(); if !t.is_empty() { log_spawner(&format!("[spawner] trace={trace_clone} stderr: {t}")); } } } }
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let t = line.trim();
+                    if !t.is_empty() {
+                        log_spawner(&format!("[spawner] trace={trace_clone} stderr: {t}"));
+                    }
+                }
+            }
+        }
     });
     let stdout_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
-        let mut log_file = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-spawner-stdout.log").ok();
-        loop { match tokio::io::AsyncReadExt::read(&mut reader, &mut chunk).await { Ok(0) | Err(_) => break, Ok(n) => { if let Some(ref mut f) = log_file { let _ = std::io::Write::write_all(f, &chunk[..n]); } buf.extend_from_slice(&chunk[..n]); } } }
+        let mut log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-spawner-stdout.log")
+            .ok();
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut reader, &mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Some(ref mut f) = log_file {
+                        let _ = std::io::Write::write_all(f, &chunk[..n]);
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
         buf
     });
     let exit_status = tokio::select! {
@@ -274,10 +325,32 @@ async fn run_subagent(args: SpawnArgs, config: Arc<SpawnerConfig>) -> String {
         Some(Ok(status)) => {
             cleanup_if(true, &codex_home);
             let events = parse_events(&stdout_bytes);
-            finish(args.task_name, args.model, args.provider, events, status, &stdout_bytes, &out_path, trace_id, t_start, t_setup_done)
+            finish(
+                args.task_name,
+                args.model,
+                args.provider,
+                events,
+                status,
+                &stdout_bytes,
+                &out_path,
+                trace_id,
+                timeout.as_secs(),
+                t_start,
+                t_setup_done,
+            )
         }
-        Some(Err(err)) => { cleanup_if(true, &codex_home); diag(&args.task_name, format!("io error: {err}"), &trace_id) }
-        None => { cleanup_if(true, &codex_home); diag(&args.task_name, format!("timed out after {}s", timeout.as_secs()), &trace_id) }
+        Some(Err(err)) => {
+            cleanup_if(true, &codex_home);
+            diag(&args.task_name, format!("io error: {err}"), &trace_id)
+        }
+        None => {
+            cleanup_if(true, &codex_home);
+            diag(
+                &args.task_name,
+                format!("timed out after {}s", timeout.as_secs()),
+                &trace_id,
+            )
+        }
     }
 }
 
@@ -347,27 +420,45 @@ fn finish(
     stdout_bytes: &[u8],
     out_path: &std::path::Path,
     trace_id: String,
+    timeout_sec: u64,
     t_start: Instant,
     t_setup_done: Instant,
 ) -> String {
-    let final_message = std::fs::read_to_string(out_path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_default();
+    let final_message = std::fs::read_to_string(out_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
     let _ = std::fs::remove_file(out_path);
-    let turn_count = events.iter().filter(|e| e.event_type == "TurnComplete").count();
-    let tool_calls: Vec<&str> = events.iter().filter(|e| e.event_type == "OutputItemDone").filter_map(|e| e.brief.as_deref()).collect();
+    let turn_count = events
+        .iter()
+        .filter(|e| e.event_type == "TurnComplete")
+        .count();
+    let tool_calls: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "OutputItemDone")
+        .filter_map(|e| e.brief.as_deref())
+        .collect();
     let setup_ms = t_setup_done.duration_since(t_start).as_millis() as u64;
     let total_ms = t_start.elapsed().as_millis() as u64;
     let subagent_ms = total_ms.saturating_sub(setup_ms);
     let mut result = json!({
         "trace_id": trace_id, "task_name": task_name, "model": model.unwrap_or_else(|| "inherited".into()), "provider": provider,
+        "timeout_sec": timeout_sec,
         "exit_code": status.code(), "turns": turn_count, "tool_calls": tool_calls,
         "timing_ms": {"setup": setup_ms, "subagent": subagent_ms, "total": total_ms},
         "final_message": if final_message.is_empty() { "(no output)" } else { final_message.as_str() },
     });
     if final_message.is_empty() && !status.success() {
-        let t = String::from_utf8_lossy(&stdout_bytes[stdout_bytes.len().saturating_sub(2000)..]).trim().to_string();
-        if !t.is_empty() { result["stdout_tail"] = json!(tail(&t, 500)); }
+        let t = String::from_utf8_lossy(&stdout_bytes[stdout_bytes.len().saturating_sub(2000)..])
+            .trim()
+            .to_string();
+        if !t.is_empty() {
+            result["stdout_tail"] = json!(tail(&t, 500));
+        }
     }
-    serde_json::to_string_pretty(&result).unwrap_or_else(|_| diag(&task_name, "failed to serialize result".into(), &trace_id))
+    serde_json::to_string_pretty(&result)
+        .unwrap_or_else(|_| diag(&task_name, "failed to serialize result".into(), &trace_id))
 }
 
 // ── event extraction ──────────────────────────────────────────────────
@@ -606,6 +697,7 @@ async fn run_proxy_daemon(args: ProxyArgs, config: SpawnerConfig) -> anyhow::Res
     proxy::serve(
         &args.listen,
         ProxyConfig {
+            provider_name: args.provider.clone(),
             upstream_base: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
             model_slug: model_slug.to_string(),
@@ -665,5 +757,34 @@ mod tests {
         assert!(catalog.contains("\"supported_reasoning_levels\""));
         assert!(catalog.contains("\"apply_patch_tool_type\""));
         cleanup_if(true, &home);
+    }
+
+    #[test]
+    fn effective_timeout_prefers_explicit_then_provider_then_default() {
+        let mut provider = ProviderConfig {
+            base_url: "https://example.test".into(),
+            proxy_url: "http://127.0.0.1:15722".into(),
+            api_key: "test-key".into(),
+            wire_api: default_wire_api(),
+            default_timeout_sec: Some(1800),
+            models: Vec::new(),
+        };
+        let mut args = SpawnArgs {
+            task_name: "timeout-test".into(),
+            message: "test".into(),
+            provider: "glm".into(),
+            model: None,
+            cwd: None,
+            timeout_sec: None,
+        };
+
+        assert_eq!(effective_timeout_sec(&args, &provider), 1800);
+
+        args.timeout_sec = Some(42);
+        assert_eq!(effective_timeout_sec(&args, &provider), 42);
+
+        args.timeout_sec = None;
+        provider.default_timeout_sec = None;
+        assert_eq!(effective_timeout_sec(&args, &provider), 600);
     }
 }

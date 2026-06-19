@@ -1,11 +1,11 @@
 ---
-name: n
+name: sub
 description: Delegate isolated implementation work to a subagent. Use for code writing, test generation, refactoring, or batch edits that can be specified without shared conversation context.
 ---
 
 # When to Use
 
-Use `spawn_agent` with `agent_type: "worker"` when the task satisfies **all three**:
+Use the `go` tool (MCP server `mcp__sub__go`) when the task satisfies **all three**:
 
 1. **Self-contained** — the prompt can describe the full job without referencing this conversation.
 2. **Code-heavy** — the work is writing/editing code, tests, configs, or docs.
@@ -26,7 +26,7 @@ Always include these 6 sections in `message`:
 6. ON FAILURE: "Report the exact error. Do not guess. Do not work around it silently."
 ```
 
-Set `cwd` to the repo root. Default `timeout_sec` is 600; set higher for builds.
+Set `cwd` to the repo root. Omit `timeout_sec` by default so the provider's configured `default_timeout_sec` applies. Only set `timeout_sec` when you intentionally want to override the provider default for this one call.
 
 # After Subagent Returns
 
@@ -46,8 +46,8 @@ If subagent fails, spawn again with a **corrected prompt** — add the error mes
 {
   "task_name": "add-auth-tests",
   "provider": "glm",
-  "cwd": "/home/arch/project",
-  "timeout_sec": 600,
-  "message": "CONTEXT: /home/arch/project, auth middleware in src/auth.py.\nTASK: Add 3 pytest tests for token expiry edge cases in tests/test_auth.py. Cover: expired token returns 401, malformed token returns 400, missing token returns 401.\nDO NOT: modify src/auth.py, change existing tests, or add new dependencies.\nCONSTRAINTS: Use pytest.raises for exceptions. Follow existing test naming (test_<scenario>).\nVERIFY: Run `python -m pytest tests/test_auth.py -v` and confirm all pass.\nON FAILURE: Report the exact error and traceback. Do not guess fixes."
+  "model": "glm-5.2",
+  "cwd": "/root/project",
+  "message": "CONTEXT: /root/project, auth middleware in src/auth.py.\nTASK: Add 3 pytest tests for token expiry edge cases in tests/test_auth.py. Cover: expired token returns 401, malformed token returns 400, missing token returns 401.\nDO NOT: modify src/auth.py, change existing tests, or add new dependencies.\nCONSTRAINTS: Use pytest.raises for exceptions. Follow existing test naming (test_<scenario>).\nVERIFY: Run `python -m pytest tests/test_auth.py -v` and confirm all pass.\nON FAILURE: Report the exact error and traceback. Do not guess fixes."
 }
 ```

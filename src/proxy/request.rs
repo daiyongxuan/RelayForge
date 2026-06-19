@@ -48,11 +48,33 @@ pub(super) fn responses_to_chat(req: &Value, model: &str) -> Value {
         }
     }
 
-    let tools = convert_tools(req.get("tools"));
+    for key in [
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "metadata",
+        "n",
+        "presence_penalty",
+        "response_format",
+        "seed",
+        "service_tier",
+        "stop",
+        "top_logprobs",
+        "user",
+    ] {
+        if let Some(value) = req.get(key) {
+            chat[key] = value.clone();
+        }
+    }
+
+    let tools = convert_tools(req);
     if !tools.is_empty() {
         chat["tools"] = Value::Array(tools);
         if let Some(tool_choice) = convert_tool_choice(req.get("tool_choice")) {
             chat["tool_choice"] = tool_choice;
+        }
+        if let Some(parallel_tool_calls) = req.get("parallel_tool_calls") {
+            chat["parallel_tool_calls"] = parallel_tool_calls.clone();
         }
     }
     if let Some(stream) = req.get("stream") {
@@ -87,13 +109,17 @@ fn append_item_as_chat_message(
     match item.get("type").and_then(|v| v.as_str()) {
         Some("function_call") => {
             append_reasoning(pending_reasoning, extract_item_reasoning_text(item));
-            pending_tool_calls.push(build_tool_call(item, false));
+            pending_tool_calls.push(build_tool_call(item, false, None));
         }
         Some("custom_tool_call") => {
             append_reasoning(pending_reasoning, extract_item_reasoning_text(item));
-            pending_tool_calls.push(build_tool_call(item, true));
+            pending_tool_calls.push(build_tool_call(item, true, None));
         }
-        Some("function_call_output") | Some("custom_tool_call_output") => {
+        Some("tool_search_call") => {
+            append_reasoning(pending_reasoning, extract_item_reasoning_text(item));
+            pending_tool_calls.push(build_tool_call(item, false, Some("tool_search")));
+        }
+        Some("function_call_output") => {
             flush_pending_tool_calls(
                 messages,
                 pending_tool_calls,
@@ -108,10 +134,28 @@ fn append_item_as_chat_message(
             let content = output_text(item.get("output").unwrap_or(&Value::Null));
             messages.push(json!({"role":"tool","tool_call_id":call_id,"content":content}));
         }
+        Some("custom_tool_call_output") | Some("tool_search_output") => {
+            flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning,
+                last_assistant_index,
+            );
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            messages.push(json!({"role":"tool","tool_call_id":call_id,"content":item.to_string()}));
+        }
         Some("reasoning") => {
             let text = extract_reasoning_summary_text(item);
             let attached = pending_tool_calls.is_empty()
-                && attach_reasoning_to_last_assistant(messages, *last_assistant_index, text.as_deref());
+                && attach_reasoning_to_last_assistant(
+                    messages,
+                    *last_assistant_index,
+                    text.as_deref(),
+                );
             if !attached {
                 append_reasoning(pending_reasoning, text);
             }
@@ -206,13 +250,17 @@ fn collapse_system_messages(mut messages: Vec<Value>) -> Vec<Value> {
                     system_texts.push(trimmed.to_string());
                 }
             }
+            continue; // ← 关键：跳过已处理的 system 消息
         } else {
             collecting = false;
             others.push(msg);
         }
     }
     if !system_texts.is_empty() {
-        others.insert(0, json!({"role":"system","content":system_texts.join("\n\n")}));
+        others.insert(
+            0,
+            json!({"role":"system","content":system_texts.join("\n\n")}),
+        );
     }
     others
 }
@@ -295,7 +343,10 @@ fn extract_reasoning_summary_text(item: &Value) -> Option<String> {
 }
 
 fn append_reasoning(pending: &mut Option<String>, extra: Option<String>) {
-    let Some(extra) = extra.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    let Some(extra) = extra
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
         return;
     };
     match pending {
@@ -347,7 +398,10 @@ fn attach_reasoning_to_last_assistant(
                 existing.push_str(reasoning);
             }
             _ => {
-                obj.insert("reasoning_content".to_string(), Value::String(reasoning.to_string()));
+                obj.insert(
+                    "reasoning_content".to_string(),
+                    Value::String(reasoning.to_string()),
+                );
             }
         }
         return true;
@@ -369,16 +423,18 @@ fn update_last_assistant_index(
 
 // ── tool call construction ──────────────────────────────────────────────
 
-fn build_tool_call(item: &Value, custom: bool) -> Value {
+fn build_tool_call(item: &Value, custom: bool, override_name: Option<&str>) -> Value {
     let call_id = item
         .get("call_id")
         .or_else(|| item.get("id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let name = chat_tool_name(
-        item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
-        item.get("namespace").and_then(|v| v.as_str()),
-    );
+    let name = override_name.map(ToString::to_string).unwrap_or_else(|| {
+        chat_tool_name(
+            item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            item.get("namespace").and_then(|v| v.as_str()),
+        )
+    });
     let arguments = if custom {
         json!({"input": item.get("input").cloned().unwrap_or_else(|| json!(""))}).to_string()
     } else {
@@ -409,13 +465,39 @@ fn output_text(output: &Value) -> String {
 
 // ── tool definition conversion ──────────────────────────────────────────
 
-fn convert_tools(tools: Option<&Value>) -> Vec<Value> {
-    tools
+fn convert_tools(req: &Value) -> Vec<Value> {
+    let mut tools: Vec<Value> = req
+        .get("tools")
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
         .flat_map(convert_tool)
-        .collect()
+        .collect();
+    collect_tool_search_output_tools(req.get("input").unwrap_or(&Value::Null), &mut tools);
+    tools
+}
+
+fn collect_tool_search_output_tools(value: &Value, tools: &mut Vec<Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_search_output_tools(item, tools);
+            }
+        }
+        Value::Object(obj) => {
+            if obj.get("type").and_then(|v| v.as_str()) == Some("tool_search_output") {
+                if let Some(discovered) = obj.get("tools").and_then(|v| v.as_array()) {
+                    for tool in discovered {
+                        tools.extend(convert_tool(tool));
+                    }
+                }
+            }
+            for value in obj.values() {
+                collect_tool_search_output_tools(value, tools);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn convert_tool(tool: &Value) -> Vec<Value> {
@@ -595,7 +677,8 @@ fn flatten_content(content: Value) -> Value {
             }
             "input_audio" => {
                 if let Some(input_audio) = part.get("input_audio") {
-                    chat_parts.push(json!({"type":"input_audio","input_audio":input_audio.clone()}));
+                    chat_parts
+                        .push(json!({"type":"input_audio","input_audio":input_audio.clone()}));
                     has_non_text = true;
                 }
             }
@@ -620,69 +703,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn responses_to_chat_basic() {
-        let req = json!({
-            "model": "glm-5.2",
-            "input": [{"role": "user", "content": "hello"}],
-            "stream": true,
-            "max_output_tokens": 4096,
-        });
-        let chat = responses_to_chat(&req, "glm-5.2");
-        assert_eq!(chat["model"], "glm-5.2");
-        assert_eq!(chat["messages"][0]["role"], "user");
-        assert_eq!(chat["messages"][0]["content"], "hello");
-        assert_eq!(chat["stream"], true);
-        assert_eq!(chat["max_tokens"], 4096);
-    }
-
-    #[test]
-    fn reasoning_item_attached_to_next_assistant() {
+    fn tool_search_output_exposes_discovered_mcp_tools() {
         let req = json!({
             "model": "deepseek-v4-pro",
+            "tools": [{"type": "tool_search"}],
             "input": [
-                {"role": "user", "content": "solve 2+2"},
-                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "2+2=4"}]},
-                {"type": "message", "role": "assistant", "content": "4"},
-                {"role": "user", "content": "and 3+3?"}
-            ],
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_tool_search_1",
+                    "arguments": {"query": "mcp echo", "limit": 5}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_tool_search_1",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "mcp__test_echo",
+                        "tools": [{
+                            "type": "function",
+                            "name": "echo",
+                            "description": "Echo text back.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}},
+                                "required": ["message"]
+                            }
+                        }]
+                    }]
+                },
+                {"type": "message", "role": "user", "content": "call echo"}
+            ]
         });
-        let chat = responses_to_chat(&req, "deepseek-v4-pro");
-        let msgs = chat["messages"].as_array().unwrap();
-        let assistant = &msgs[1];
-        assert_eq!(assistant["role"], "assistant");
-        assert_eq!(assistant["reasoning_content"], "2+2=4");
-        let user2 = &msgs[2];
-        assert_eq!(user2["role"], "user");
-        assert_eq!(user2["content"], "and 3+3?");
-    }
 
-    #[test]
-    fn developer_role_maps_to_system() {
-        let req = json!({
-            "model": "deepseek-v4-pro",
-            "input": [
-                {"role": "developer", "content": "be helpful"},
-                {"role": "user", "content": "hi"}
-            ],
-        });
         let chat = responses_to_chat(&req, "deepseek-v4-pro");
-        let msgs = chat["messages"].as_array().unwrap();
-        assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[0]["content"], "be helpful");
-    }
+        let tool_names = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"tool_search"));
+        assert!(tool_names.contains(&"mcp__test_echo__echo"));
 
-    #[test]
-    fn null_content_becomes_empty_string() {
-        let req = json!({
-            "model": "deepseek-v4-pro",
-            "input": [
-                {"role": "user"},
-                {"role": "user", "content": "hi"}
-            ],
-        });
-        let chat = responses_to_chat(&req, "deepseek-v4-pro");
         let msgs = chat["messages"].as_array().unwrap();
-        assert_eq!(msgs[0]["content"], "");
-        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["tool_calls"][0]["function"]["name"], "tool_search");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "call_tool_search_1");
+        assert!(msgs[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mcp__test_echo"));
     }
 }

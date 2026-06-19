@@ -317,11 +317,11 @@ write_model_catalog() {
   local catalog
   catalog=$(python3 << PYEOF
 import json
-catalog = {
-  "models": [{
-    "slug": "${DEEPSEEK_MODEL}",
-    "display_name": "${DEEPSEEK_MODEL}",
-    "description": f"${DEEPSEEK_MODEL} via cc-switch (RelayForge)",
+def model(slug, display_name, description, priority):
+  return {
+    "slug": slug,
+    "display_name": display_name,
+    "description": description,
     "context_window": ${CONTEXT_WINDOW},
     "max_context_window": ${CONTEXT_WINDOW},
     "auto_compact_token_limit": ${COMPACT_LIMIT},
@@ -335,7 +335,7 @@ catalog = {
     "shell_type": "shell_command",
     "visibility": "list",
     "supported_in_api": True,
-    "priority": 1,
+    "priority": priority,
     "additional_speed_tiers": [],
     "service_tiers": [],
     "base_instructions": "",
@@ -353,12 +353,18 @@ catalog = {
     "input_modalities": ["text"],
     "supports_search_tool": False,
     "use_responses_lite": False
-  }]
+  }
+
+catalog = {
+  "models": [
+    model("${DEEPSEEK_MODEL}", "${DEEPSEEK_MODEL}", "${DEEPSEEK_MODEL} via cc-switch (RelayForge)", 0),
+    model("${GLM_MODEL}", "${GLM_MODEL}", "${GLM_MODEL} via RelayForge local proxy", 1),
+  ]
 }
 print(json.dumps(catalog, indent=2))
 PYEOF
 )
-  write_if_diff "${CODEX_HOME}/model-catalog.json" "${catalog}" "model catalog (DeepSeek 1M)"
+  write_if_diff "${CODEX_HOME}/model-catalog.json" "${catalog}" "model catalog (DeepSeek + GLM 1M)"
 }
 
 # ── Step 6: Write mcp-spawner.toml (GLM provider) ──────────────────────
@@ -370,6 +376,7 @@ base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 proxy_url = "http://127.0.0.1:${GLM_PROXY_PORT}"
 api_key = "${GLM_API_KEY}"
 wire_api = "responses"
+default_timeout_sec = 1800
 models = [
   { slug = "${GLM_MODEL}", context_window = 1000000 },
 ]
@@ -454,7 +461,7 @@ Always include these 6 sections in `message`:
 5. VERIFY: exact commands to run for validation.
 6. ON FAILURE: "Report the exact error. Do not guess. Do not work around it silently."
 
-Set `cwd` to the repo root. Default `timeout_sec` is 600; set higher for builds.
+Set `cwd` to the repo root. Omit `timeout_sec` to use the provider default; set it explicitly for unusually long builds.
 
 # After Subagent Returns
 

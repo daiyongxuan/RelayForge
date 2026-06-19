@@ -38,6 +38,7 @@ Create `~/.codex/mcp-spawner.toml` with a provider entry:
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 proxy_url = "http://127.0.0.1:15722"
 api_key = "..."
+default_timeout_sec = 1800
 
 [[providers.glm.models]]
 slug = "glm-5.2"
@@ -63,4 +64,3 @@ tool_timeout_sec = 900
 [mcp_servers.subagent-spawner.tools.spawn_agent]
 approval_mode = "approve"
 ```
-

@@ -44,7 +44,7 @@ Provider Proxy 是提前在 Codex 沙箱外启动的 daemon。它接收子 agent
 | 组件 | 状态 | 备注 |
 |---|---|---|
 | MCP server 注册 | ✅ | config.toml `[mcp_servers.subagent-spawner]` |
-| 工具注册 + schema | ✅ | spawn_agent(task_name, message, provider, model?, cwd?, timeout_sec?) |
+| 工具注册 + schema | ✅ | spawn_agent(task_name, message, provider, model?, cwd?, timeout_sec? 仅覆盖默认时填写) |
 | 请求翻译 (R→C) | ✅ | `responses_to_chat()` |
 | SSE 翻译 (C→R) | ✅ | `SseState` 状态机，5 种 SSE 事件 |
 | proxy daemon | ✅ | `codex-mcp-spawner proxy --provider glm --listen 127.0.0.1:15722` |
@@ -63,6 +63,7 @@ Provider Proxy 是提前在 Codex 沙箱外启动的 daemon。它接收子 agent
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 proxy_url = "http://127.0.0.1:15722"
 api_key = "..."
+default_timeout_sec = 1800
 
 [[providers.glm.models]]
 slug = "glm-5.2"

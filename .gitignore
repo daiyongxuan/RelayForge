@@ -11,3 +11,5 @@ mcp-spawner.toml
 *.env
 *.log
 
+/test/
+
